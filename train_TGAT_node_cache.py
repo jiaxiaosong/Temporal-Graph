@@ -14,6 +14,7 @@ import pickle
 import copy
 import shutil
 import importlib
+from sklearn.metrics import roc_auc_score
 import scipy.sparse as spp
 
 
@@ -25,7 +26,7 @@ torch.manual_seed(seed_num)
 random.seed(seed_num)
 np.random.seed(seed_num)
 
-parser = argparse.ArgumentParser('Interface for TGAT experiments on link predictions')
+parser = argparse.ArgumentParser('Interface for TGAT experiments on node classification')
 
 parser.add_argument('-d', '--data', type=str, help='data sources to use, try wikipedia or reddit', default='wikipedia_small')
 parser.add_argument('--n_head', type=int, default=2, help='number of heads used in attention layer')
@@ -34,14 +35,15 @@ parser.add_argument('--n_layer', type=int, default=2, help='number of network la
 parser.add_argument('--lr', type=float, default=1e-4, help='learning rate')
 parser.add_argument('--drop_out', type=float, default=0.1, help='dropout probability')
 parser.add_argument('--device', type=str, default="cuda:0", help='idx for the gpu to use')
-parser.add_argument('--name', type=str, default="TGAT-L", help='the name of this setting')
+parser.add_argument('--name', type=str, default="TGAT-N", help='The name of this setting')
+parser.add_argument('--pretrained', type=str, default="None", help='The position of pretrained model')
 parser.add_argument('--tbatch_num', type=int, default=3, help='tbatch_num')
 parser.add_argument('--val_interval', type=int, default=1, help='every number of epoches to evaluate')
 parser.add_argument('--test_interval', type=int, default=1, help='every number of epoches to test')
 parser.add_argument('--snapshot_interval', type=int, default=5, help='every number of epoches to save snapshot of model')
-parser.add_argument('--neg_sampling_ratio', type=int, default=1, help='The ratio of negative sampling')
 parser.add_argument('--shuffle', type=bool, default=False, help='shuffle the tbatch')
 args = parser.parse_args()
+
 
 print(args)
 class Logger():
@@ -85,10 +87,11 @@ print("Node Num:", num_node, "Edge Num:", num_edge, "edge_feature_dim", edge_fea
 linkage_df.ts = (linkage_df.ts - linkage_df.ts.mean()) / linkage_df.ts.std()
 edge_feature = (edge_feature - edge_feature.mean(axis=0)) / (edge_feature.std(axis=0)+1e-17)
 node_feature = (node_feature - node_feature.mean(axis=0)) / (node_feature.std(axis=0)+1e-17)
-#linkage_df["feat"] = edge_feature.tolist()
 node_feature = torch.Tensor(node_feature).to(device)
 edge_feature = torch.Tensor(edge_feature).to(device)
 timestamp_feature = torch.Tensor(linkage_df.ts).unsqueeze(-1).to(device)
+
+
 
 ### Train Val Test 0.7 - 0.15 - 0.15
 entire_start_timestamp = float(linkage_df.ts.min())
@@ -104,8 +107,6 @@ tbatch_num = args.tbatch_num#500.0
 tbatch_timespan = float((train_edge.ts.max()-train_edge.ts.min())/float(tbatch_num))
 
 
-
-###With cache
 temporal_graph_dic = {}
 def build_temporal_graph_cache(node_feature, edge_list, time_index, start_timestamp, tbatch_timespan, state):
     now_time = start_timestamp + (time_index+1) * tbatch_timespan
@@ -143,6 +144,8 @@ def build_temporal_graph_cache(node_feature, edge_list, time_index, start_timest
         now_graph.readonly()
         tmp_dic["graph"] = now_graph
         tmp_dic["now_all_node"] = now_all_node
+        #tmp_dic["now_src_node"] = now_src_node
+        #tmp_dic["now_dst_node"] = now_dst_node
         tmp_dic["now_all_edge"] = np.array(now_all_edge.index)
         tmp_dic["now_dst_node_local"] = set(now_all_local_i.tolist())
         tmp_dic["t_now"] = now_time
@@ -162,17 +165,28 @@ def build_temporal_graph_cache(node_feature, edge_list, time_index, start_timest
     else:
         return None, None, None, None, None, None
 
-neg_sampling_ratio = args.neg_sampling_ratio
+
 
 
 gnn_model = model_module.TGAT(num_layers=args.n_layer, n_head=args.n_head, node_dim=node_feature.shape[-1], d_k=node_feature.shape[-1], d_v=node_feature.shape[-1], d_T=node_feature.shape[-1], edge_dim=node_feature.shape[-1], device=device, dropout=args.drop_out)
 
-link_classifier = model_module.MergeLayer(node_feature.shape[-1], node_feature.shape[-1], node_feature.shape[-1], 1)
-optimizer = torch.optim.Adam(list(gnn_model.parameters())+list(link_classifier.parameters()), lr=args.lr)
+node_classifier = model_module.LR(node_feature.shape[-1])
+optimizer = torch.optim.Adam(node_classifier.parameters(), lr=args.lr)
+
+
+pretrained_model = args.pretrained
+if pretrained_model != "None":
+    print("Load:", pretrained_model)
+    gnn_model.load_state_dict(torch.load(pretrained_model, map_location="cpu"))
 
 criterion = torch.nn.BCELoss().to(device)
 gnn_model.to(device)
-link_classifier.to(device)
+node_classifier.to(device)
+gnn_model.eval()
+
+###It seems that they change them to eval but not freeze
+#for param in gnn_model.parameters():
+#    param.requires_grad = False
 
 
 
@@ -197,14 +211,12 @@ class AverageMeter(object):
 ## Build Graph Based on the Current Time
 epoch_num = args.n_epoch
 
-best_val_ap = 0
-best_val_ap_epoch = 0
-best_val_acc = 0
-best_val_acc_epoch = 0
+best_auc_roc = 0
+best_auc_roc_epoch = 0
 def run_model(start_timestamp, end_timestamp, state):
-    global best_val_acc, best_val_acc_epoch, best_val_ap, best_val_ap_epoch
+    global best_auc_roc, best_auc_roc_epoch
     time_index = 0
-    all_acc, all_ap, all_f1, all_auc, all_m_loss = AverageMeter(), AverageMeter(), AverageMeter(), AverageMeter(), AverageMeter()
+    all_score, all_label, all_loss = [], [], AverageMeter()
     tmp_tbatch_num = int((end_timestamp-start_timestamp)/tbatch_timespan)+1
     print_freq = tmp_tbatch_num // 3 + 1
     if state == "Train":
@@ -218,60 +230,53 @@ def run_model(start_timestamp, end_timestamp, state):
         random.shuffle(tbatch_index)
     start_time = time.time()
     for index, time_index in enumerate(tbatch_index):
-        #print(start_timestamp, end_timestamp, time_index, time_index * tbatch_timespan)
-        now_graph, new_src_node_local, new_dst_node_local, now_dst_node_local, new_src_node_label, t_now = build_temporal_graph_cache(node_feature, linkage_df, time_index, start_timestamp, tbatch_timespan, state)
-        if now_graph is None:
-            continue
-        now_graph.to(torch.device(device))
-        
-        optimizer.zero_grad()
-        if is_train:
-            gnn_model.train()
-            link_classifier.train()
-        else:
-            gnn_model.eval()
-            link_classifier.eval()
-        with torch.set_grad_enabled(is_train):
-            node_embedding = gnn_model(now_graph, t_now)
+        with torch.no_grad():
+            now_graph, new_src_node_local, new_dst_node_local, now_dst_node_local, new_src_node_label, t_now = build_temporal_graph_cache(node_feature, linkage_df, time_index, start_timestamp, tbatch_timespan, state)
+            if now_graph is None:
+                continue
+            now_graph.to(torch.device(device))
 
+            optimizer.zero_grad()
+            node_embedding = gnn_model(now_graph, t_now)
             del now_graph
-            with torch.no_grad():
-                ##dim: num_of_new_edge
-                neg_dst_node = np.array(np.array([random.sample(now_dst_node_local-set([new_dst_node_local[i]]), neg_sampling_ratio) for i in range(len(new_dst_node_local))]))
-                sample_src_node = np.repeat(new_src_node_local, neg_sampling_ratio+1, axis=-1).ravel()
-                sample_dst_node = np.concatenate([np.expand_dims(new_dst_node_local, axis=-1), neg_dst_node], axis=-1).ravel()
-                label = torch.Tensor(([1]+[0]*neg_sampling_ratio)*new_src_node_local.shape[0]).to(device)
-            
-            prob = link_classifier(node_embedding[sample_src_node], node_embedding[sample_dst_node]).sigmoid().squeeze()
-            loss = criterion(prob, label)
-            if is_train:
+            src_node = new_src_node_local
+            label  = torch.Tensor(new_src_node_label).to(device)
+
+        if is_train:
+            node_classifier.train()
+        else:
+            node_classifier.eval()
+        prob = node_classifier(node_embedding[new_src_node_local]).sigmoid().squeeze()
+        loss = criterion(prob, label)
+        if is_train:
                 loss.backward()
                 optimizer.step()
                 optimizer.zero_grad()
         with torch.no_grad():
-            label = label.cpu().detach().numpy()
-            pred_score = prob.cpu().detach().numpy()
-            pred_label = pred_score > 0.5
-            all_ap.update(average_precision_score(label, pred_score), label.shape[0])
-            all_acc.update((pred_label==label).mean(), label.shape[0])
-            all_m_loss.update(loss.item(), label.shape[0])
-            all_auc.update(roc_auc_score(label, pred_score), label.shape[0])
-            all_f1.update(f1_score(label, pred_label), label.shape[0])
-        if is_train & ((index+1) % print_freq == 0):
-            print('Train Epoch: [{0}][{1}/{2}][{all_ap.count}({3})], AP {all_ap.val:.4f}({all_ap.avg:.4f}), Acc {all_acc.val:.4f}({all_acc.avg:.4f}), Loss {all_m_loss.val:.2e}({all_m_loss.avg:.2e}), Auc {all_auc.val:.4f}({all_auc.avg:.4f}), F1 {all_f1.val:.4f}({all_f1.avg:.4f})'.format(epoch, index+1, tmp_tbatch_num, new_src_node_local.shape[0], all_ap=all_ap, all_acc=all_acc, all_m_loss=all_m_loss, all_auc=all_auc, all_f1=all_f1))
+            #label = label.cpu().detach().numpy()
+            #pred_score = prob.cpu().detach().numpy()
+            #all_loss.append(loss.item())
+            all_score.append(prob.cpu().detach().numpy())
+            all_label.append(label.cpu().detach().numpy())
+            #all_auc_roc.update(roc_auc_score(label, pred_score), src_node.shape[0])
+            all_loss.update(loss.item(), src_node.shape[0])
+        #if is_train & (time_index % print_freq == 0):
+            #print('Train Epoch: [{0}][{1}/{2}][{all_ap.count}({3})], AUC {all_auc_roc.val:.4f}({all_auc_roc.avg:.4f}), Loss {all_loss.val:.2e}({all_loss.avg:.2e})'.format(epoch, time_index, tmp_tbatch_num, new_edge.shape[0], all_auc_roc=all_auc_roc, all_loss=all_loss))
     print("Time:", time.time()-start_time)
+    roc_auc = roc_auc_score(np.concatenate(all_label), np.concatenate(all_score))
+    #print((np.concatenate(all_label)==(np.concatenate(all_score)>0.5)).mean(), "1111111111111111111111111111111")
     if state == "Val":
         state = "**** " + state
-        if best_val_acc < all_acc.avg:
-            best_val_acc = all_acc.avg
-            best_val_acc_epoch = epoch
-        if best_val_ap < all_ap.avg:
-            best_val_ap = all_ap.avg
-            best_val_ap_epoch = epoch
-        print("Best Val, Epoch {0}, Acc {1:.4f} (Epoch {2}), AP {3:.4f} (Epoch {4})".format(epoch, best_val_acc, best_val_acc_epoch, best_val_ap, best_val_ap_epoch))
+        if best_auc_roc < roc_auc:
+            best_auc_roc = roc_auc
+            best_auc_roc_epoch = epoch
+        #print("Best Val, Epoch {0}, AUC {1:.4f} (Epoch {2})".format(epoch, best_auc_roc, best_auc_roc_epoch))
     if state == "Test":
         state = "!!!! " + state
-    print(state+' Epoch: [{0}][{1}/{2}][{all_ap.count}], AP {all_ap.val:.4f}({all_ap.avg:.4f}), Acc {all_acc.val:.4f}({all_acc.avg:.4f}), Loss {all_m_loss.val:.2e}({all_m_loss.avg:.2e}), Auc {all_auc.val:.4f}({all_auc.avg:.4f}), F1 {all_f1.val:.4f}({all_f1.avg:.4f})'.format(epoch, tmp_tbatch_num, tmp_tbatch_num, all_ap=all_ap, all_acc=all_acc, all_m_loss=all_m_loss, all_auc=all_auc, all_f1=all_f1))
+    if state == "Train":
+        print(all_loss.avg, roc_auc)
+    #print(all_loss.val)
+    print(state+' Epoch: [{0}][{1}/{2}][{all_loss.count}], AUC {roc_auc:.4f},  Loss {all_loss.val:.2e}({all_loss.avg:.2e})'.format(epoch, tmp_tbatch_num, tmp_tbatch_num, roc_auc=roc_auc, all_loss=all_loss))
 
 
 for epoch in range(1, args.n_epoch+1):
@@ -289,7 +294,7 @@ for epoch in range(1, args.n_epoch+1):
         file_path2 = os.path.join(snapshot_dir, "Epoch_"+str(epoch)+"_link_cls.model")
         if torch.cuda.is_available():
             torch.save(gnn_model.state_dict(), file_path1)
-            torch.save(link_classifier.state_dict(), file_path2)
+            torch.save(node_classifier.state_dict(), file_path2)
         else:
             torch.save(gnn_model.state_dict(), file_path1)
-            torch.save(link_classifier.state_dict(), file_path2)
+            torch.save(node_classifier.state_dict(), file_path2)
