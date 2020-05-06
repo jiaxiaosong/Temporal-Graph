@@ -35,13 +35,15 @@ parser.add_argument('--n_layer', type=int, default=2, help='number of network la
 parser.add_argument('--lr', type=float, default=1e-4, help='learning rate')
 parser.add_argument('--drop_out', type=float, default=0.1, help='dropout probability')
 parser.add_argument('--device', type=str, default="cuda:0", help='idx for the gpu to use')
-parser.add_argument('--name', type=str, default="TGAT-N", help='The name of this setting')
+parser.add_argument('--name', type=str, default="", help='The name of this setting')
 parser.add_argument('--pretrained', type=str, default="None", help='The position of pretrained model')
 parser.add_argument('--tbatch_num', type=int, default=3, help='tbatch_num')
 parser.add_argument('--val_interval', type=int, default=1, help='every number of epoches to evaluate')
 parser.add_argument('--test_interval', type=int, default=1, help='every number of epoches to test')
 parser.add_argument('--snapshot_interval', type=int, default=5, help='every number of epoches to save snapshot of model')
 parser.add_argument('--shuffle', type=bool, default=False, help='shuffle the tbatch')
+##wiki pos0.14% reddit:0.05%
+parser.add_argument('--pos_weight', type=int, default=1, help='weight for positive samples')
 args = parser.parse_args()
 
 
@@ -61,7 +63,7 @@ class Logger():
         pass
 
 dataset_name = args.data
-setting_name = args.name
+setting_name = "TGAT-N"+args.name
 device = args.device#"cuda:0"#"cpu"
 log_dir = str(dataset_name+"_"+setting_name+"_"+time.strftime("%Y-%m-%d-%H_%M_%S",time.localtime(time.time())))
 os.mkdir(log_dir)
@@ -179,7 +181,8 @@ if pretrained_model != "None":
     print("Load:", pretrained_model)
     gnn_model.load_state_dict(torch.load(pretrained_model, map_location="cpu"))
 
-criterion = torch.nn.BCELoss().to(device)
+
+criterion = torch.nn.BCEWithLogitsLoss(pos_weight=torch.Tensor([args.pos_weight])).to(device)
 gnn_model.to(device)
 node_classifier.to(device)
 gnn_model.eval()
@@ -229,6 +232,10 @@ def run_model(start_timestamp, end_timestamp, state):
     if args.shuffle:
         random.shuffle(tbatch_index)
     start_time = time.time()
+    if is_train:
+        node_classifier.train()
+    else:
+        node_classifier.eval()
     for index, time_index in enumerate(tbatch_index):
         with torch.no_grad():
             now_graph, new_src_node_local, new_dst_node_local, now_dst_node_local, new_src_node_label, t_now = build_temporal_graph_cache(node_feature, linkage_df, time_index, start_timestamp, tbatch_timespan, state)
@@ -242,12 +249,8 @@ def run_model(start_timestamp, end_timestamp, state):
             src_node = new_src_node_local
             label  = torch.Tensor(new_src_node_label).to(device)
 
-        if is_train:
-            node_classifier.train()
-        else:
-            node_classifier.eval()
-        prob = node_classifier(node_embedding[new_src_node_local]).sigmoid().squeeze()
-        loss = criterion(prob, label)
+        prob = node_classifier(node_embedding[new_src_node_local]).squeeze()
+        loss = criterion(prob, label)/args.pos_weight
         if is_train:
                 loss.backward()
                 optimizer.step()
