@@ -1,5 +1,5 @@
 import os
-num_thread = 6
+num_thread = 2
 os.environ["OMP_NUM_THREADS"] = str(num_thread) # export OMP_NUM_THREADS=1
 os.environ["OPENBLAS_NUM_THREADS"] = str(num_thread) # export OPENBLAS_NUM_THREADS=1
 os.environ["MKL_NUM_THREADS"] = str(num_thread) # export MKL_NUM_THREADS=1
@@ -25,9 +25,6 @@ import importlib
 import scipy.sparse as spp
 
 
-model_file = "TGAT_nf"
-model_module = importlib.import_module("model_folder."+model_file)
-print("Process Id:", os.getpid())
 seed_num = 0
 torch.manual_seed(seed_num)
 random.seed(seed_num)
@@ -50,9 +47,12 @@ parser.add_argument('--snapshot_interval', type=int, default=5, help='every numb
 parser.add_argument('--neg_sampling_ratio', type=int, default=1, help='The ratio of negative sampling')
 parser.add_argument('--shuffle', type=bool, default=False, help='shuffle the tbatch')
 parser.add_argument('--expand_factor', type=int, default=20, help='sampling neighborhood size')
+parser.add_argument('--model_file', type=str, default="TGAT_nf", help='the model file')
 args = parser.parse_args()
 
-print(args)
+
+model_file = args.model_file
+model_module = importlib.import_module("model_folder."+model_file)
 class Logger():
     def __init__(self, lognames):
         self.terminal = sys.stdout
@@ -77,7 +77,11 @@ sys.stderr = Logger(["%s.log"%(dataset_name+setting_name), os.path.join(log_dir,
 snapshot_dir = os.path.join(log_dir, "snapshot")
 if not os.path.isdir(snapshot_dir):
     os.makedirs(snapshot_dir)
+    
+print("Process Id:", os.getpid())
 print(os.path.join(log_dir, sys.argv[0]))
+print(args)
+
 shutil.copyfile(__file__, os.path.join(log_dir, "train.py"))
 shutil.copyfile(os.path.join("model_folder", model_file+".py"), os.path.join(log_dir, model_file+".py"))
 
@@ -88,6 +92,7 @@ edge_feature = np.load('./processed/processed_edge_feat_{}.npy'.format(dataset_n
 node_feature = np.load('./processed/processed_node_feat_{}.npy'.format(dataset_name))
 num_node = max(linkage_df.u.max(), linkage_df.i.max())+1
 num_edge = linkage_df.shape[0]
+
 print("Node Num:", num_node, "Edge Num:", num_edge, "edge_feature_dim", edge_feature.shape[1])
 
 ##Normalize Features
@@ -111,8 +116,8 @@ test_edge = linkage_df[linkage_df.ts>test_start_timetamp]
 ###mask
 all_val_u_node = set(list(val_edge.u) + list(test_edge.u))
 all_val_i_node = set(list(val_edge.i) + list(test_edge.i))
-masked_u_node = random.sample(all_val_u_node, int(len(all_val_u_node)*0.1))
-masked_i_node = random.sample(all_val_i_node, int(len(all_val_i_node)*0.1))
+masked_u_node = random.sample(all_val_u_node, int(len(all_val_u_node)*0.05))
+masked_i_node = random.sample(all_val_i_node, int(len(all_val_i_node)*0.05))
 train_edge = train_edge[(~train_edge['u'].isin(masked_u_node))&(~train_edge['i'].isin(masked_i_node))]
 
 ###Different from the TGAT paper, we use the model in t-batch instead of only one loss for each item-node in one of the three sets. It is the same evaluation method as in the original dataset paper: Predicting Dynamic Embedding Trajectory in Temporal Interaction Networks. S. Kumar, X. Zhang, J. Leskovec. ACM SIGKDD International Conference on Knowledge Discovery and Data Mining (KDD), 2019. 
@@ -189,7 +194,7 @@ def build_temporal_graph_cache(node_feature, edge_list, time_index, start_timest
 neg_sampling_ratio = args.neg_sampling_ratio
 
 
-gnn_model = model_module.TGAT_nf(num_layers=args.n_layer, n_head=args.n_head, node_dim=node_feature.shape[-1], d_k=node_feature.shape[-1], d_v=node_feature.shape[-1], d_T=node_feature.shape[-1], edge_dim=node_feature.shape[-1], device=device, dropout=args.drop_out)
+gnn_model = model_module.TGAT_nf(num_layers=args.n_layer, n_head=args.n_head, node_dim=node_feature.shape[-1], d_k=node_feature.shape[-1]//args.n_head, d_v=node_feature.shape[-1]//args.n_head, d_T=node_feature.shape[-1], edge_dim=node_feature.shape[-1], device=device, dropout=args.drop_out)
 
 link_classifier = model_module.MergeLayer(node_feature.shape[-1], node_feature.shape[-1], node_feature.shape[-1], 1)
 optimizer = torch.optim.Adam(list(gnn_model.parameters())+list(link_classifier.parameters()), lr=args.lr)
@@ -311,9 +316,9 @@ def run_model(start_timestamp, end_timestamp, state):
         if best_val_ap < all_ap.avg:
             best_val_ap = all_ap.avg
             best_val_ap_epoch = epoch
-        print_text =  "**** " + print_text + ", Tran_Acc {transduct_acc.val:.4f}({transduct_acc.avg:.4f}, Tran_AP {transduct_ap.val:.4f}({transduct_ap.avg:.4f}), Indu_Acc {induct_acc.val:.4f}({induct_acc.avg:.4f}), Indu_AP {induct_ap.val:.4f}({induct_ap.avg:.4f})\n".format(transduct_acc=transduct_acc, transduct_ap=transduct_ap, induct_acc=induct_acc, induct_ap=induct_ap) + "Best Val: Acc {1:.4f} (Epoch {2}), AP {3:.4f} (Epoch {4})".format(epoch, best_val_acc, best_val_acc_epoch, best_val_ap, best_val_ap_epoch)
+        print_text =  "**** " + print_text + ", Tran_Acc {transduct_acc.val:.4f}({transduct_acc.avg:.4f}), Tran_AP {transduct_ap.val:.4f}({transduct_ap.avg:.4f}), Indu_Acc {induct_acc.val:.4f}({induct_acc.avg:.4f}), Indu_AP {induct_ap.val:.4f}({induct_ap.avg:.4f})\n".format(transduct_acc=transduct_acc, transduct_ap=transduct_ap, induct_acc=induct_acc, induct_ap=induct_ap) + "Best Val: Acc {1:.4f} (Epoch {2}), AP {3:.4f} (Epoch {4})".format(epoch, best_val_acc, best_val_acc_epoch, best_val_ap, best_val_ap_epoch)
     if state == "Test":
-        print_text = "!!!! " + print_text + ", Tran_Acc {transduct_acc.val:.4f}({transduct_acc.avg:.4f}, Tran_AP {transduct_ap.val:.4f}({transduct_ap.avg:.4f}), Indu_Acc {induct_acc.val:.4f}({induct_acc.avg:.4f}), Indu_AP {induct_ap.val:.4f}({induct_ap.avg:.4f})".format(transduct_acc=transduct_acc, transduct_ap=transduct_ap, induct_acc=induct_acc, induct_ap=induct_ap)
+        print_text = "!!!! " + print_text + ", Tran_Acc {transduct_acc.val:.4f}({transduct_acc.avg:.4f}), Tran_AP {transduct_ap.val:.4f}({transduct_ap.avg:.4f}), Indu_Acc {induct_acc.val:.4f}({induct_acc.avg:.4f}), Indu_AP {induct_ap.val:.4f}({induct_ap.avg:.4f})".format(transduct_acc=transduct_acc, transduct_ap=transduct_ap, induct_acc=induct_acc, induct_ap=induct_ap)
     print(print_text)
     print("Time:", time.time()-start_time)
 

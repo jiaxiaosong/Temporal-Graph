@@ -1,6 +1,6 @@
 import os
 
-num_thread = 6
+num_thread = 4
 os.environ["OMP_NUM_THREADS"] = str(num_thread) # export OMP_NUM_THREADS=1
 os.environ["OPENBLAS_NUM_THREADS"] = str(num_thread) # export OPENBLAS_NUM_THREADS=1
 os.environ["MKL_NUM_THREADS"] = str(num_thread) # export MKL_NUM_THREADS=1
@@ -27,9 +27,7 @@ from sklearn.metrics import roc_auc_score
 import scipy.sparse as spp
 
 
-model_file = "TGAT_nf"
-model_module = importlib.import_module("model_folder."+model_file)
-print("Process Id:", os.getpid())
+
 seed_num = 0
 torch.manual_seed(seed_num)
 random.seed(seed_num)
@@ -54,10 +52,12 @@ parser.add_argument('--shuffle', type=bool, default=False, help='shuffle the tba
 ##wiki pos0.14% reddit:0.05%
 parser.add_argument('--pos_weight', type=int, default=1, help='weight for positive samples')
 parser.add_argument('--expand_factor', type=int, default=20, help='sampling neighborhood size')
+parser.add_argument('--model_file', type=str, default="TGAT_nf", help='the model file')
 args = parser.parse_args()
 
 
-print(args)
+model_file = args.model_file
+model_module = importlib.import_module("model_folder."+model_file)
 class Logger():
     def __init__(self, lognames):
         self.terminal = sys.stdout
@@ -82,7 +82,9 @@ sys.stderr = Logger(["%s.log"%(dataset_name+setting_name), os.path.join(log_dir,
 snapshot_dir = os.path.join(log_dir, "snapshot")
 if not os.path.isdir(snapshot_dir):
     os.makedirs(snapshot_dir)
+print("Process Id:", os.getpid())
 print(os.path.join(log_dir, sys.argv[0]))
+print(args)
 shutil.copyfile(__file__, os.path.join(log_dir, "train.py"))
 shutil.copyfile(os.path.join("model_folder", model_file+".py"), os.path.join(log_dir, model_file+".py"))
 
@@ -117,8 +119,8 @@ test_edge = linkage_df[linkage_df.ts>test_start_timetamp]
 ###mask
 all_val_u_node = set(list(val_edge.u) + list(test_edge.u))
 all_val_i_node = set(list(val_edge.i) + list(test_edge.i))
-masked_u_node = random.sample(all_val_u_node, int(len(all_val_u_node)*0.1))
-masked_i_node = random.sample(all_val_i_node, int(len(all_val_i_node)*0.1))
+masked_u_node = random.sample(all_val_u_node, int(len(all_val_u_node)*0.05))
+masked_i_node = random.sample(all_val_i_node, int(len(all_val_i_node)*0.05))
 train_edge = train_edge[(~train_edge['u'].isin(masked_u_node))&(~train_edge['i'].isin(masked_i_node))]
 
 ###Different from the TGAT paper, we use the model in t-batch instead of only one loss for each item-node in one of the three sets. It is the same evaluation method as in the original dataset paper: Predicting Dynamic Embedding Trajectory in Temporal Interaction Networks. S. Kumar, X. Zhang, J. Leskovec. ACM SIGKDD International Conference on Knowledge Discovery and Data Mining (KDD), 2019. 
@@ -192,7 +194,7 @@ def build_temporal_graph_cache(node_feature, edge_list, time_index, start_timest
 
 
 
-gnn_model = model_module.TGAT_nf(num_layers=args.n_layer, n_head=args.n_head, node_dim=node_feature.shape[-1], d_k=node_feature.shape[-1], d_v=node_feature.shape[-1], d_T=node_feature.shape[-1], edge_dim=node_feature.shape[-1], device=device, dropout=args.drop_out)
+gnn_model = model_module.TGAT_nf(num_layers=args.n_layer, n_head=args.n_head, node_dim=node_feature.shape[-1], d_k=node_feature.shape[-1]//args.n_head, d_v=node_feature.shape[-1]//args.n_head, d_T=node_feature.shape[-1], edge_dim=node_feature.shape[-1], device=device, dropout=args.drop_out)
 
 node_classifier = model_module.LR(node_feature.shape[-1])
 optimizer = torch.optim.Adam(node_classifier.parameters(), lr=args.lr)
@@ -271,18 +273,20 @@ def run_model(start_timestamp, end_timestamp, state):
                 nf.copy_from_parent(ctx=torch.device(device))
                 optimizer.zero_grad()
                 node_embedding = gnn_model(nf, t_now)[nf.map_from_parent_nid(layer_id=args.n_layer, parent_nids=torch.Tensor(new_src_node_local).type(torch.int64), remap_local=True),...]
-
             with torch.set_grad_enabled(is_train):
                 prob = node_classifier(node_embedding).squeeze()
+                if prob.size() != label.size():
+                    continue
                 loss = criterion(prob, label)/args.pos_weight
+                with torch.no_grad():
+                    all_score.append(prob.cpu().detach().numpy())
+                    all_label.append(label.cpu().detach().numpy())
+                    all_loss.update(loss.item(), label.shape[0])
             if is_train:
                 loss.backward()
                 optimizer.step()
                 optimizer.zero_grad()
-            with torch.no_grad():
-                all_score.append(prob.cpu().detach().numpy())
-                all_label.append(label.cpu().detach().numpy())
-                all_loss.update(loss.item(), label.shape[0])
+
         del now_graph
         torch.cuda.empty_cache()
     print("Time:", time.time()-start_time)
