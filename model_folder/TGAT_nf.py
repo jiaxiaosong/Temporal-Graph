@@ -169,6 +169,7 @@ class TGAT_nf(nn.Module):
         super(TGAT_nf, self).__init__()
         self.gnn_layers =  torch.nn.ModuleList([TGATLayer_nf(n_head, node_dim, d_k, d_v, d_T, edge_dim, dropout, act, device=device) for _ in range(num_layers)])
         self.num_layers = num_layers
+        self.device = device
     def forward(self, nf, t_now):
         nf.layers[0].data['node_h'] = nf.layers[0].data['node_raw_feat']
         for i in range(self.num_layers):
