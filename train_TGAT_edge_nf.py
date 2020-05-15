@@ -47,7 +47,10 @@ parser.add_argument('--snapshot_interval', type=int, default=5, help='every numb
 parser.add_argument('--neg_sampling_ratio', type=int, default=1, help='The ratio of negative sampling')
 parser.add_argument('--shuffle', type=bool, default=False, help='shuffle the tbatch')
 parser.add_argument('--expand_factor', type=int, default=20, help='sampling neighborhood size')
-parser.add_argument('--model_file', type=str, default="TGAT_nf", help='the model file')
+parser.add_argument('--local_rnn_layer', type=int, default=1, help='the number of layer for RNN to aggregate neighborhood (if applicable)')
+parser.add_argument('--local_rnn_bidirection', type=bool, default=True, help='whether use bidirection RNN to aggregate neighborhood (if applicable)')
+parser.add_argument('--model_file', type=str, default="TGAT_nf_v4", help='the model file')
+parser.add_argument('--encoding', type=str, default="none", help='temporal encoding method')
 args = parser.parse_args()
 
 
@@ -116,8 +119,8 @@ test_edge = linkage_df[linkage_df.ts>test_start_timetamp]
 ###mask
 all_val_u_node = set(list(val_edge.u) + list(test_edge.u))
 all_val_i_node = set(list(val_edge.i) + list(test_edge.i))
-masked_u_node = random.sample(all_val_u_node, int(len(all_val_u_node)*0.05))
-masked_i_node = random.sample(all_val_i_node, int(len(all_val_i_node)*0.05))
+masked_u_node = random.sample(all_val_u_node, int(len(all_val_u_node)*0.1))
+masked_i_node = random.sample(all_val_i_node, int(len(all_val_i_node)*0.1))
 train_edge = train_edge[(~train_edge['u'].isin(masked_u_node))&(~train_edge['i'].isin(masked_i_node))]
 
 ###Different from the TGAT paper, we use the model in t-batch instead of only one loss for each item-node in one of the three sets. It is the same evaluation method as in the original dataset paper: Predicting Dynamic Embedding Trajectory in Temporal Interaction Networks. S. Kumar, X. Zhang, J. Leskovec. ACM SIGKDD International Conference on Knowledge Discovery and Data Mining (KDD), 2019. 
@@ -194,7 +197,7 @@ def build_temporal_graph_cache(node_feature, edge_list, time_index, start_timest
 neg_sampling_ratio = args.neg_sampling_ratio
 
 
-gnn_model = model_module.TGAT_nf(num_layers=args.n_layer, n_head=args.n_head, node_dim=node_feature.shape[-1], d_k=node_feature.shape[-1]//args.n_head, d_v=node_feature.shape[-1]//args.n_head, d_T=node_feature.shape[-1], edge_dim=node_feature.shape[-1], device=device, dropout=args.drop_out)
+gnn_model = model_module.TGAT_nf(num_layers=args.n_layer, n_head=args.n_head, node_dim=node_feature.shape[-1], d_k=node_feature.shape[-1]//args.n_head, d_v=node_feature.shape[-1]//args.n_head, d_T=node_feature.shape[-1], args=args, edge_dim=node_feature.shape[-1], device=device, dropout=args.drop_out)
 
 link_classifier = model_module.MergeLayer(node_feature.shape[-1], node_feature.shape[-1], node_feature.shape[-1], 1)
 optimizer = torch.optim.Adam(list(gnn_model.parameters())+list(link_classifier.parameters()), lr=args.lr)

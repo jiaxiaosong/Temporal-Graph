@@ -52,6 +52,9 @@ parser.add_argument('--shuffle', type=bool, default=False, help='shuffle the tba
 parser.add_argument('--pos_weight', type=int, default=1, help='weight for positive samples')
 parser.add_argument('--expand_factor', type=int, default=20, help='sampling neighborhood size')
 parser.add_argument('--model_file', type=str, default="TGAT_nf", help='the model file')
+parser.add_argument('--local_rnn_layer', type=int, default=1, help='the number of layer for RNN to aggregate neighborhood (if applicable)')
+parser.add_argument('--local_rnn_bidirection', type=bool, default=False, help='whether use bidirection RNN to aggregate neighborhood (if applicable)')
+parser.add_argument('--encoding', type=str, default="temporal", help='temporal encoding method')
 args = parser.parse_args()
 
 
@@ -119,10 +122,13 @@ test_edge = linkage_df[linkage_df.ts>test_start_timetamp]
 ###mask
 all_val_u_node = set(list(val_edge.u) + list(test_edge.u))
 all_val_i_node = set(list(val_edge.i) + list(test_edge.i))
-masked_u_node = random.sample(all_val_u_node, int(len(all_val_u_node)*0.05))
-masked_i_node = random.sample(all_val_i_node, int(len(all_val_i_node)*0.05))
+masked_u_node = random.sample(all_val_u_node, int(len(all_val_u_node)*0.1))
+masked_i_node = random.sample(all_val_i_node, int(len(all_val_i_node)*0.1))
+print("masked nodes", "u:", len(masked_u_node), "i:", len(masked_i_node))
+origin_train_edge_len = len(train_edge)
 train_edge = train_edge[(~train_edge['u'].isin(masked_u_node))&(~train_edge['i'].isin(masked_i_node))]
-
+print("masked training edges:", origin_train_edge_len-len(train_edge))
+#
 ###Different from the TGAT paper, we use the model in t-batch instead of only one loss for each item-node in one of the three sets. It is the same evaluation method as in the original dataset paper: Predicting Dynamic Embedding Trajectory in Temporal Interaction Networks. S. Kumar, X. Zhang, J. Leskovec. ACM SIGKDD International Conference on Knowledge Discovery and Data Mining (KDD), 2019. 
 tbatch_num = args.tbatch_num#500.0
 tbatch_timespan = float((train_edge.ts.max()-train_edge.ts.min())/float(tbatch_num))
@@ -193,8 +199,7 @@ def build_temporal_graph_cache(node_feature, edge_list, time_index, start_timest
         return None, None, None, None, None, None, None
 
 
-
-gnn_model = model_module.TGAT_nf(num_layers=args.n_layer, n_head=args.n_head, node_dim=node_feature.shape[-1], d_k=node_feature.shape[-1]//args.n_head, d_v=node_feature.shape[-1]//args.n_head, d_T=node_feature.shape[-1], edge_dim=node_feature.shape[-1], device=device, dropout=args.drop_out)
+gnn_model = model_module.TGAT_nf(num_layers=args.n_layer, n_head=args.n_head, node_dim=node_feature.shape[-1], d_k=node_feature.shape[-1]//args.n_head, d_v=node_feature.shape[-1]//args.n_head, d_T=node_feature.shape[-1], args=args, edge_dim=edge_feature.shape[-1], device=device, dropout=args.drop_out)
 
 node_classifier = model_module.LR(node_feature.shape[-1])
 optimizer = torch.optim.Adam(list(node_classifier.parameters())+list(gnn_model.parameters()), lr=args.lr)
@@ -264,7 +269,7 @@ def run_model(start_timestamp, end_timestamp, state):
         gnn_model.train()
     else:
         node_classifier.eval()
-        gnn_model.eval
+        gnn_model.eval()
 
     for index, time_index in enumerate(tbatch_index):
         optimizer.zero_grad()
