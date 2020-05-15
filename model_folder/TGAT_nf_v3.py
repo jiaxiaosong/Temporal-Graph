@@ -47,22 +47,20 @@ class PositionwiseFeedForward(nn.Module):
     ''' A two-feed-forward-layer module '''
     def __init__(self, d_in, d_hid, dropout):
         super().__init__()
-        self.w_1 = nn.Conv1d(d_in, d_hid, 1) # position-wise
-        self.w_2 = nn.Conv1d(d_hid, d_in, 1) # position-wise
+        self.w_1 = nn.Linear(d_in, d_hid, 1) # position-wise
+        self.w_2 = nn.Linear(d_hid, d_in, 1) # position-wise
         self.layer_norm = nn.LayerNorm(d_in)
         self.dropout = nn.Dropout(dropout)
     def forward(self, x):
         residual = x
-        output = x.transpose(1, 2)
-        output = self.w_2(F.relu(self.w_1(output)))
-        output = output.transpose(1, 2)
+        output = self.w_2(F.relu(self.w_1(x)))
         output = self.dropout(output)
         output = self.layer_norm(output + residual)
         return output
 
-class TGATLayer_v2(nn.Module):
+class TGATLayer_v3(nn.Module):
     def __init__(self, n_head, node_dim, d_k, d_v, args, edge_dim=None, dropout=0.1, act=torch.nn.functional.gelu, device="cpu"):
-        super(TGATLayer_v2, self).__init__()
+        super(TGATLayer_v3, self).__init__()
         ### Multi-head Atnn
         self.n_head = n_head
         self.act = act
@@ -81,6 +79,8 @@ class TGATLayer_v2(nn.Module):
         #if n_head * d_k != d_model:
             #d_k = d_model//n_head
             #d_v = d_k
+        
+        ###Mutual Attn
         self.w_qs = nn.Linear(d_model, n_head * d_k, bias=False)
         self.w_ks = nn.Linear(d_model, n_head * d_k, bias=False)
         self.w_vs = nn.Linear(d_model, n_head * d_v, bias=False)
@@ -94,6 +94,20 @@ class TGATLayer_v2(nn.Module):
         self.attn_layer_norm = nn.LayerNorm(d_model)
         self.attn_dropout = nn.Dropout(dropout)
 
+        ####Target to Others
+        self.residual_weight = torch.nn.Parameter(torch.Tensor([1])).to(device)
+        self.w_qs_single = nn.Linear(d_model, n_head * d_k, bias=False)
+        self.w_ks_single = nn.Linear(d_model, n_head * d_k, bias=False)
+        self.w_vs_single = nn.Linear(d_model, n_head * d_v, bias=False)
+        nn.init.normal_(self.w_qs_single.weight, mean=0, std=np.sqrt(2.0 / (d_model + d_k)))
+        nn.init.normal_(self.w_ks_single.weight, mean=0, std=np.sqrt(2.0 / (d_model + d_k)))
+        nn.init.normal_(self.w_vs_single.weight, mean=0, std=np.sqrt(2.0 / (d_model + d_v)))
+        self.attention_single = ScaledDotProductAttention(temperature=np.power(d_k, 0.5), attn_dropout=dropout)
+        self.attn_fc_single = nn.Linear(n_head * d_v, d_model)
+        nn.init.xavier_normal_(self.attn_fc_single.weight)
+        self.pos_ffn_single = PositionwiseFeedForward(d_model, d_model*4, dropout=dropout)
+        self.attn_layer_norm_single = nn.LayerNorm(d_model)
+        self.attn_dropout_single = nn.Dropout(dropout)
 
         ##Temporal Encoding
         self.basis_freq = torch.nn.Parameter((torch.from_numpy(1 / 10 ** np.linspace(0, 9, self.d_model))).float()).view(1, -1).to(device)
@@ -126,25 +140,37 @@ class TGATLayer_v2(nn.Module):
 
     def reduce_func(self, nodes):
         node_batch, neightbor_num, _ = nodes.mailbox['q'].size()
+        ###Mutual Attn
         q = nodes.mailbox['q'].view(node_batch, neightbor_num, self.n_head, -1).permute(2, 0, 1, 3).contiguous().view(-1, neightbor_num, self.d_k) # (n_head*node_batch), neightbor_num, d_k
         k = nodes.mailbox['k'].view(node_batch, neightbor_num, self.n_head, -1).permute(2, 0, 1, 3).contiguous().view(-1, neightbor_num, self.d_k) # (n_head*node_batch), neightbor_num, d_k
         v = nodes.mailbox['v'].view(node_batch, neightbor_num, self.n_head, -1).permute(2, 0, 1, 3).contiguous().view(-1, neightbor_num, self.d_v) # (n_head*node_batch), neightbor_num, d_v
-
         output, attn = self.attention(q, k, v, mask=None) #(n_head*node_batch), neighbor_num, d_v
         output = output.view(self.n_head, node_batch, neightbor_num, -1).permute(1, 2, 0, 3).contiguous().view(node_batch, neightbor_num, self.n_head*self.d_v)  #node_batch, neighbor_num, d_v * n_head
         output = self.attn_dropout(self.attn_fc(output)) #node_batch, neighbor_num, d_model
         output = self.attn_layer_norm(output + nodes.mailbox['z'])
-        
         output = self.pos_ffn(output) #node_batch, neighbor_num, d_model
 
-        output = output.mean(dim=1) #node_batch, d_model
+        residual = output.mean(1) #node_batch, d_model
+        ###Target to Others
+        q = self.w_qs_single(output[:,-1,:]) #node_batch, 1, n_head*d_k self-loop term
+        k = self.w_ks_single(output[:,:-1,:]) #node_batch, neighbor_num-1, n_head*d_k neighbor term
+        v = self.w_vs_single(output[:,:-1,:]) #node_batch, neighbor_num-1, n_head*d_v neighbor term
+        q = q.view(node_batch, 1, self.n_head, self.d_k).permute(2,0,1,3).contiguous().view(-1, 1, self.d_k)
+        k = k.view(node_batch, neightbor_num-1, self.n_head, self.d_k).permute(2,0,1,3).contiguous().view(-1, neightbor_num-1, self.d_k)
+        v = k.view(node_batch, neightbor_num-1, self.n_head, self.d_v).permute(2,0,1,3).contiguous().view(-1, neightbor_num-1, self.d_v)
+        output, attn = self.attention_single(q, k, v) #(n_head*node_batch), d_model
+        output = output.squeeze(1).view(self.n_head, node_batch, -1).permute(1, 0, 2).contiguous().view(node_batch, -1)#node_batch, n_head*d_v
+        output = self.attn_dropout_single(self.attn_fc_single(output)) #node_batch, d_model
+        output = self.attn_layer_norm_single(residual*self.residual_weight + output) #node_batch, d_model
+        output = self.pos_ffn_single(output) #node_batch, d_model
+        
         output = self.layer_norm(self.act(self.fea2node(output)) + nodes.mailbox['lst_node_h'][:,-1,:])
         return {"node_h":output}
 
 class TGAT_nf(nn.Module):
     def __init__(self, num_layers, n_head, node_dim, d_k, d_v, d_T, args, edge_dim = None, dropout=0.1, act=torch.nn.functional.gelu, device="cpu"):
         super(TGAT_nf, self).__init__()
-        self.gnn_layers =  torch.nn.ModuleList([TGATLayer_v2(n_head, node_dim, d_k, d_v, args, edge_dim, dropout, act, device=device) for _ in range(num_layers)])
+        self.gnn_layers =  torch.nn.ModuleList([TGATLayer_v3(n_head, node_dim, d_k, d_v, args, edge_dim, dropout, act, device=device) for _ in range(num_layers)])
         self.num_layers = num_layers
         self.device = device
     def forward(self, nf, t_now):

@@ -60,9 +60,9 @@ class PositionwiseFeedForward(nn.Module):
         output = self.layer_norm(output + residual)
         return output
 
-class TGATLayer_v2(nn.Module):
+class TGATLayer_v4(nn.Module):
     def __init__(self, n_head, node_dim, d_k, d_v, args, edge_dim=None, dropout=0.1, act=torch.nn.functional.gelu, device="cpu"):
-        super(TGATLayer_v2, self).__init__()
+        super(TGATLayer_v4, self).__init__()
         ### Multi-head Atnn
         self.n_head = n_head
         self.act = act
@@ -84,9 +84,15 @@ class TGATLayer_v2(nn.Module):
         self.w_qs = nn.Linear(d_model, n_head * d_k, bias=False)
         self.w_ks = nn.Linear(d_model, n_head * d_k, bias=False)
         self.w_vs = nn.Linear(d_model, n_head * d_v, bias=False)
+        self.w_qs_src = nn.Linear(d_model, n_head * d_k, bias=False)
+        self.w_ks_src = nn.Linear(d_model, n_head * d_k, bias=False)
+        self.w_vs_src = nn.Linear(d_model, n_head * d_v, bias=False)
         nn.init.normal_(self.w_qs.weight, mean=0, std=np.sqrt(2.0 / (d_model + d_k)))
         nn.init.normal_(self.w_ks.weight, mean=0, std=np.sqrt(2.0 / (d_model + d_k)))
         nn.init.normal_(self.w_vs.weight, mean=0, std=np.sqrt(2.0 / (d_model + d_v)))
+        nn.init.normal_(self.w_qs_src.weight, mean=0, std=np.sqrt(2.0 / (d_model + d_k)))
+        nn.init.normal_(self.w_ks_src.weight, mean=0, std=np.sqrt(2.0 / (d_model + d_k)))
+        nn.init.normal_(self.w_vs_src.weight, mean=0, std=np.sqrt(2.0 / (d_model + d_v)))
         self.attention = ScaledDotProductAttention(temperature=np.power(d_k, 0.5), attn_dropout=dropout)
         self.attn_fc = nn.Linear(n_head * d_v, d_model)
         nn.init.xavier_normal_(self.attn_fc.weight)
@@ -101,7 +107,7 @@ class TGATLayer_v2(nn.Module):
         self.t_now = None
 
         ###Aggregate Neighbor
-        self.fea2node = nn.Linear(d_model, self.node_dim)
+        self.fea2node = nn.Linear(d_model*2, self.node_dim)
         nn.init.xavier_normal_(self.fea2node.weight)
         self.layer_norm = nn.LayerNorm(self.node_dim)
 
@@ -126,25 +132,33 @@ class TGATLayer_v2(nn.Module):
 
     def reduce_func(self, nodes):
         node_batch, neightbor_num, _ = nodes.mailbox['q'].size()
-        q = nodes.mailbox['q'].view(node_batch, neightbor_num, self.n_head, -1).permute(2, 0, 1, 3).contiguous().view(-1, neightbor_num, self.d_k) # (n_head*node_batch), neightbor_num, d_k
-        k = nodes.mailbox['k'].view(node_batch, neightbor_num, self.n_head, -1).permute(2, 0, 1, 3).contiguous().view(-1, neightbor_num, self.d_k) # (n_head*node_batch), neightbor_num, d_k
-        v = nodes.mailbox['v'].view(node_batch, neightbor_num, self.n_head, -1).permute(2, 0, 1, 3).contiguous().view(-1, neightbor_num, self.d_v) # (n_head*node_batch), neightbor_num, d_v
+
+        #### node itself should have different projection
+        self_q = self.w_qs_src(nodes.mailbox['z'][:,-1,:]).unsqueeze(1) 
+        self_k = self.w_ks_src(nodes.mailbox['z'][:,-1,:]).unsqueeze(1)
+        self_v = self.w_vs_src(nodes.mailbox['z'][:,-1,:]).unsqueeze(1)
+        q = torch.cat([nodes.mailbox['q'][:,:-1,:], self_q], dim=1) ##node_batch, neightbor_num, n_head*d_k
+        k = torch.cat([nodes.mailbox['k'][:,:-1,:], self_q], dim=1) ##node_batch, neightbor_num, n_head*d_k
+        v = torch.cat([nodes.mailbox['v'][:,:-1,:], self_q], dim=1) ##node_batch, neightbor_num, n_head*d_v
+        
+        q = q.view(node_batch, neightbor_num, self.n_head, -1).permute(2, 0, 1, 3).contiguous().view(-1, neightbor_num, self.d_k) # (n_head*node_batch), neightbor_num, d_k
+        k = k.view(node_batch, neightbor_num, self.n_head, -1).permute(2, 0, 1, 3).contiguous().view(-1, neightbor_num, self.d_k) # (n_head*node_batch), neightbor_num, d_k
+        v = v.view(node_batch, neightbor_num, self.n_head, -1).permute(2, 0, 1, 3).contiguous().view(-1, neightbor_num, self.d_v) # (n_head*node_batch), neightbor_num, d_v
 
         output, attn = self.attention(q, k, v, mask=None) #(n_head*node_batch), neighbor_num, d_v
         output = output.view(self.n_head, node_batch, neightbor_num, -1).permute(1, 2, 0, 3).contiguous().view(node_batch, neightbor_num, self.n_head*self.d_v)  #node_batch, neighbor_num, d_v * n_head
         output = self.attn_dropout(self.attn_fc(output)) #node_batch, neighbor_num, d_model
-        output = self.attn_layer_norm(output + nodes.mailbox['z'])
-        
+        output = self.attn_layer_norm(output + nodes.mailbox['z']) 
         output = self.pos_ffn(output) #node_batch, neighbor_num, d_model
 
-        output = output.mean(dim=1) #node_batch, d_model
-        output = self.layer_norm(self.act(self.fea2node(output)) + nodes.mailbox['lst_node_h'][:,-1,:])
+        neighborhood = output[:,:-1,:].mean(dim=1) #node_batch, d_model
+        output = self.layer_norm(self.act(self.fea2node(torch.cat([output[:,-1,:],neighborhood], dim=-1))) + nodes.mailbox['lst_node_h'][:,-1,:])
         return {"node_h":output}
 
 class TGAT_nf(nn.Module):
     def __init__(self, num_layers, n_head, node_dim, d_k, d_v, d_T, args, edge_dim = None, dropout=0.1, act=torch.nn.functional.gelu, device="cpu"):
         super(TGAT_nf, self).__init__()
-        self.gnn_layers =  torch.nn.ModuleList([TGATLayer_v2(n_head, node_dim, d_k, d_v, args, edge_dim, dropout, act, device=device) for _ in range(num_layers)])
+        self.gnn_layers =  torch.nn.ModuleList([TGATLayer_v4(n_head, node_dim, d_k, d_v, args, edge_dim, dropout, act, device=device) for _ in range(num_layers)])
         self.num_layers = num_layers
         self.device = device
     def forward(self, nf, t_now):

@@ -60,9 +60,9 @@ class PositionwiseFeedForward(nn.Module):
         output = self.layer_norm(output + residual)
         return output
 
-class TGATLayer_v2(nn.Module):
+class TGATLayer_localRNN(nn.Module):
     def __init__(self, n_head, node_dim, d_k, d_v, args, edge_dim=None, dropout=0.1, act=torch.nn.functional.gelu, device="cpu"):
-        super(TGATLayer_v2, self).__init__()
+        super(TGATLayer_localRNN, self).__init__()
         ### Multi-head Atnn
         self.n_head = n_head
         self.act = act
@@ -73,6 +73,8 @@ class TGATLayer_v2(nn.Module):
         self.node_dim = node_dim
         self.device = device
         self.encoding = args.encoding
+        self.local_rnn_layer = args.local_rnn_layer
+        self.local_rnn_bidirection = args.local_rnn_bidirection 
         d_model = node_dim
         if  self.edge_dim:
             self.edge_fc = nn.Linear(self.edge_dim, self.node_dim)
@@ -101,7 +103,12 @@ class TGATLayer_v2(nn.Module):
         self.t_now = None
 
         ###Aggregate Neighbor
-        self.fea2node = nn.Linear(d_model, self.node_dim)
+        self.agg_lstm = nn.LSTM(input_size=d_model, hidden_size=d_model, num_layers=self.local_rnn_layer, bidirectional=self.local_rnn_bidirection, batch_first=True)
+
+        if self.local_rnn_bidirection:
+            self.fea2node = nn.Linear(d_model*3, self.node_dim)
+        else:
+            self.fea2node = nn.Linear(d_model*2, self.node_dim)
         nn.init.xavier_normal_(self.fea2node.weight)
         self.layer_norm = nn.LayerNorm(self.node_dim)
 
@@ -134,17 +141,18 @@ class TGATLayer_v2(nn.Module):
         output = output.view(self.n_head, node_batch, neightbor_num, -1).permute(1, 2, 0, 3).contiguous().view(node_batch, neightbor_num, self.n_head*self.d_v)  #node_batch, neighbor_num, d_v * n_head
         output = self.attn_dropout(self.attn_fc(output)) #node_batch, neighbor_num, d_model
         output = self.attn_layer_norm(output + nodes.mailbox['z'])
-        
         output = self.pos_ffn(output) #node_batch, neighbor_num, d_model
 
-        output = output.mean(dim=1) #node_batch, d_model
-        output = self.layer_norm(self.act(self.fea2node(output)) + nodes.mailbox['lst_node_h'][:,-1,:])
+        ##aggregate:
+        neighbor, (_, _)  = self.agg_lstm(output[:,:-1,:]) #node_batch, d_model
+        neighbor = neighbor.mean(dim=1) #node_batch, d_model
+        output = self.layer_norm(self.act(self.fea2node(torch.cat([neighbor, output[:,-1,:].unsqueeze(1)], dim=1))) + nodes.mailbox['lst_node_h'][:,-1,:])
         return {"node_h":output}
 
 class TGAT_nf(nn.Module):
     def __init__(self, num_layers, n_head, node_dim, d_k, d_v, d_T, args, edge_dim = None, dropout=0.1, act=torch.nn.functional.gelu, device="cpu"):
         super(TGAT_nf, self).__init__()
-        self.gnn_layers =  torch.nn.ModuleList([TGATLayer_v2(n_head, node_dim, d_k, d_v, args, edge_dim, dropout, act, device=device) for _ in range(num_layers)])
+        self.gnn_layers =  torch.nn.ModuleList([TGATLayer_localRNN(n_head, node_dim, d_k, d_v, args, edge_dim, dropout, act, device=device) for _ in range(num_layers)])
         self.num_layers = num_layers
         self.device = device
     def forward(self, nf, t_now):
@@ -154,6 +162,10 @@ class TGAT_nf(nn.Module):
             nf.block_compute(i, message_func=self.gnn_layers[i].message_func, reduce_func=self.gnn_layers[i].reduce_func)
         
         return nf.layers[-1].data.pop('node_h')
+
+
+
+
 
 
 class LR(torch.nn.Module):

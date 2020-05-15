@@ -72,7 +72,7 @@ class MergeLayer(torch.nn.Module):
         return self.fc2(h)
 
 class TGATLayer_nf(nn.Module):
-    def __init__(self, n_head, node_dim, d_k, d_v, d_T, edge_dim=None, dropout=0.1, act=nn.LeakyReLU(negative_slope=0.2), device="cpu"):
+    def __init__(self, n_head, node_dim, d_k, d_v, d_T, args, edge_dim=None, dropout=0.1, act=nn.LeakyReLU(negative_slope=0.2), device="cpu"):
         super(TGATLayer_nf, self).__init__()
 
         ### Multi-head Atnn
@@ -89,6 +89,7 @@ class TGATLayer_nf(nn.Module):
         if  self.edge_dim:
             d_model +=  self.edge_dim
         self.d_model = d_model
+        self.encoding = args.encoding
         ##TGAT's authors simply let d_model//n_head = d_k and make sure d_model%n_head = 0
         #assert(n_head * d_k == d_model)
         #assert(d_k == d_v)
@@ -117,10 +118,13 @@ class TGATLayer_nf(nn.Module):
         self.merger = MergeLayer(self.d_model, node_dim, node_dim, node_dim)
 
     def message_func(self, edges):
-        #edge_features: time-stamp
-        t_encoding = self.t_now - edges.data["t"]#Edge_Num, 1
-        t_encoding = t_encoding * self.basis_freq + self.phase #edge_batch, d_t
-        t_encoding = torch.cos(t_encoding)
+        if self.encoding == "temporal":
+            #edge_features: time-stamp
+            t_encoding = self.t_now - edges.data["t"]#Edge_Num, 1
+            t_encoding = t_encoding * self.basis_freq + self.phase #edge_batch, d_t
+            t_encoding = torch.cos(t_encoding)
+        if self.encoding == 'none':
+            t_encoding = torch.zeros(edges.src['node_h'].shape[0], self.d_T).to(self.device)
 
         ##node features edges.src['h']) edge_batch, node_dim
         if self.edge_dim:
@@ -165,9 +169,9 @@ class TGATLayer_nf(nn.Module):
 
 
 class TGAT_nf(nn.Module):
-    def __init__(self, num_layers, n_head, node_dim, d_k, d_v, d_T, edge_dim = None, dropout=0.1, act=nn.LeakyReLU(negative_slope=0.2), device="cpu"):
+    def __init__(self, num_layers, n_head, node_dim, d_k, d_v, d_T, args, edge_dim = None, dropout=0.1, act=nn.LeakyReLU(negative_slope=0.2), device="cpu"):
         super(TGAT_nf, self).__init__()
-        self.gnn_layers =  torch.nn.ModuleList([TGATLayer_nf(n_head, node_dim, d_k, d_v, d_T, edge_dim, dropout, act, device=device) for _ in range(num_layers)])
+        self.gnn_layers =  torch.nn.ModuleList([TGATLayer_nf(n_head, node_dim, d_k, d_v, d_T, args, edge_dim, dropout, act, device=device) for _ in range(num_layers)])
         self.num_layers = num_layers
         self.device = device
     def forward(self, nf, t_now):
