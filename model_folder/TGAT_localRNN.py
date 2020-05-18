@@ -146,7 +146,7 @@ class TGATLayer_localRNN(nn.Module):
         ##aggregate:
         neighbor, (_, _)  = self.agg_lstm(output[:,:-1,:]) #node_batch, d_model
         neighbor = neighbor.mean(dim=1) #node_batch, d_model
-        output = self.layer_norm(self.act(self.fea2node(torch.cat([neighbor, output[:,-1,:].unsqueeze(1)], dim=1))) + nodes.mailbox['lst_node_h'][:,-1,:])
+        output = self.layer_norm(self.act(self.fea2node(torch.cat([neighbor, output[:,-1,:]], dim=1))) + nodes.mailbox['lst_node_h'][:,-1,:])
         return {"node_h":output}
 
 class TGAT_nf(nn.Module):
