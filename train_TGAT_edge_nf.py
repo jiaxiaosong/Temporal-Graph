@@ -270,6 +270,7 @@ def run_model(start_timestamp, end_timestamp, state):
             neg_dst_node = np.array(np.array([random.sample(now_dst_node_local-set([new_dst_node_local[i]]), neg_sampling_ratio) for i in range(len(new_dst_node_local))]))
             sample_src_node = np.repeat(new_src_node_local, neg_sampling_ratio+1, axis=-1).ravel()
             sample_dst_node = np.concatenate([np.expand_dims(new_dst_node_local, axis=-1), neg_dst_node], axis=-1).ravel()
+            print(new_dst_node_local, sample_dst_node)
             label = torch.Tensor(([1]+[0]*neg_sampling_ratio)*new_src_node_local.shape[0]).to(device)
 
         with torch.set_grad_enabled(is_train):
